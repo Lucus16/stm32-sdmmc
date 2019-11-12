@@ -1,0 +1,17 @@
+[package]
+name = "stm32-sdmmc"
+version = "0.1.0"
+authors = ["Lars Jellema <lars.jellema@gmail.com>"]
+edition = "2018"
+
+[features]
+stm32l4x6 = []
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nb = "0.1.2"
+
+[dependencies.stm32l4]
+version = "0.8.0"
+features = ["stm32l4x6"]
