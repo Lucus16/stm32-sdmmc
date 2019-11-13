@@ -1,12 +1,16 @@
 use stm32l4::stm32l4x6 as stm32;
 
-use crate::{AppCommand, Block, BlockCount, BlockIndex, CardVersion, Command, Error};
+use crate::{AppCommand, Block, BlockCount, BlockIndex, CardHost, CardVersion, Command, Error};
 use crate::Error::*;
+use nb::Error::{Other, WouldBlock};
+use nb::block;
 
 const SDMMC1_ADDRESS: u32 = 0x4001_2800;
 const FIFO_OFFSET: u32 = 0x80;
 const SEND_IF_COND_PATTERN: u32 = 0x0000_01aa;
+const STATUS_ERROR_MASK: u32 = 0x0000_05ff;
 
+#[derive(Copy, Clone, Debug)]
 enum State {
     Uninitialized,
     Ready,
@@ -29,7 +33,128 @@ impl Device {
         }
     }
 
-    pub fn init(&mut self) -> Result<(), Error> {
+    fn check_operating_conditions(&mut self) -> Result<(), Error> {
+        match self.card_command_short(Command::SEND_IF_COND, SEND_IF_COND_PATTERN) {
+            Err(e) => Err(e),
+            Ok(received_pattern) => {
+                if received_pattern != SEND_IF_COND_PATTERN {
+                    Err(OperatingConditionsNotSupported)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn acmd41(&mut self) -> Result<u32, Error> {
+        self.card_command_short(Command::APP_COMMAND, 0)?;
+        self.sdmmc.arg.write(|w| unsafe { w.bits(0x4010_0000) });
+        self.sdmmc.cmd.write(|w| unsafe {
+            w.cmdindex()
+                .bits(AppCommand::SD_SEND_OP_COND as u8)
+                .waitresp()
+                .bits(1)
+                .cpsmen()
+                .set_bit()
+        });
+
+        // acmd41 does not set crc so we expect crcfail
+        match block!(self.check_command(true)) {
+            Err(CRCFail) => Ok(()),
+            x => x,
+        }?;
+
+        Ok(self.sdmmc.resp1.read().bits())
+    }
+
+    fn card_command_none(&mut self, cmd: Command, arg: u32) -> Result<(), Error> {
+        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
+        self.sdmmc.cmd.write(|w| unsafe {
+            w.cmdindex()
+                .bits(cmd as u8)
+                .waitresp()
+                .bits(0)
+                .cpsmen()
+                .set_bit()
+        });
+
+        block!(self.check_command(false))
+    }
+
+    fn card_command_short(&mut self, cmd: Command, arg: u32) -> Result<u32, Error> {
+        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
+        self.sdmmc.cmd.write(|w| unsafe {
+            w.cmdindex()
+                .bits(cmd as u8)
+                .waitresp()
+                .bits(1)
+                .cpsmen()
+                .set_bit()
+        });
+
+        block!(self.check_command(true))?;
+        if self.sdmmc.respcmd.read().respcmd().bits() != cmd as u8 {
+            return Err(UnexpectedResponse);
+        }
+
+        Ok(self.sdmmc.resp1.read().bits())
+    }
+
+    fn card_command_long(&mut self, cmd: Command, arg: u32) -> Result<[u32; 4], Error> {
+        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
+        self.sdmmc.cmd.write(|w| unsafe {
+            w.cmdindex()
+                .bits(cmd as u8)
+                .waitresp()
+                .bits(3)
+                .cpsmen()
+                .set_bit()
+        });
+
+        block!(self.check_command(true))?;
+        // This delay helps with command recognition in the logic analyzer.
+        // TODO: Remove
+        let foo = 0u32;
+        for _ in 0..0x200 { unsafe { core::ptr::read_volatile(&foo); } }
+
+        Ok([
+            self.sdmmc.resp1.read().bits(),
+            self.sdmmc.resp2.read().bits(),
+            self.sdmmc.resp3.read().bits(),
+            self.sdmmc.resp4.read().bits(),
+        ])
+    }
+
+    fn check_ready(&mut self) -> nb::Result<(), Error> {
+        match self.state {
+            State::Uninitialized => Err(Other(Error::Uninitialized)),
+            State::Ready => Ok(()),
+            State::Reading | State::Writing => Err(WouldBlock),
+        }
+    }
+
+    fn check_command(&mut self, expect_response: bool) -> nb::Result<(), Error> {
+        let status = self.sdmmc.sta.read();
+        if status.cmdact().bit() {
+            return Err(WouldBlock);
+        }
+        self.sdmmc.icr.write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
+        if status.ccrcfail().bit() {
+            Err(Other(CRCFail))
+        } else if status.ctimeout().bit() {
+            Err(Other(Timeout))
+        } else if expect_response && !status.cmdrend().bit() {
+            Err(Other(UnknownResult))
+        } else if !expect_response && !status.cmdsent().bit() {
+            Err(Other(UnknownResult))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CardHost for Device {
+    fn init(&mut self) -> Result<(), Error> {
         // Enable power, then clock.
         self.sdmmc.clkcr.modify(|_, w| unsafe { w.clkdiv().bits(0x7e).clken().clear_bit() });
         self.sdmmc.power.modify(|_, w| unsafe { w.pwrctrl().bits(3) });
@@ -67,165 +192,14 @@ impl Device {
         Ok(())
     }
 
-    fn check_operating_conditions(&mut self) -> Result<(), Error> {
-        match self.card_command_short(Command::SEND_IF_COND, SEND_IF_COND_PATTERN) {
-            Err(e) => Err(e),
-            Ok(received_pattern) => {
-                if received_pattern != SEND_IF_COND_PATTERN {
-                    Err(OperatingConditionsNotSupported)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    fn acmd41(&mut self) -> Result<u32, Error> {
-        self.card_command_short(Command::APP_COMMAND, 0)?;
-        self.sdmmc.arg.write(|w| unsafe { w.bits(0x4010_0000) });
-        self.sdmmc.cmd.write(|w| unsafe {
-            w.cmdindex()
-                .bits(AppCommand::SD_SEND_OP_COND as u8)
-                .waitresp()
-                .bits(1)
-                .cpsmen()
-                .set_bit()
-        });
-
-        // acmd41 does not set crc so we expect crcfail
-        match self.check_command() {
-            Err(CRCFail) => Ok(()),
-            x => x,
-        }?;
-
-        Ok(self.sdmmc.resp1.read().bits())
-    }
-
-    fn card_command_none(&mut self, cmd: Command, arg: u32) -> Result<(), Error> {
-        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
-        self.sdmmc.cmd.write(|w| unsafe {
-            w.cmdindex()
-                .bits(cmd as u8)
-                .waitresp()
-                .bits(0)
-                .cpsmen()
-                .set_bit()
-        });
-        while !self.sdmmc.sta.read().cmdsent().bit() { }
-        self.sdmmc.icr.write(|w| w.cmdsentc().set_bit());
-        Ok(())
-    }
-
-    fn card_command_short(&mut self, cmd: Command, arg: u32) -> Result<u32, Error> {
-        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
-        self.sdmmc.cmd.write(|w| unsafe {
-            w.cmdindex()
-                .bits(cmd as u8)
-                .waitresp()
-                .bits(1)
-                .cpsmen()
-                .set_bit()
-        });
-
-        self.check_command()?;
-        if self.sdmmc.respcmd.read().respcmd().bits() != cmd as u8 {
-            return Err(ResponseToOtherCommand);
-        }
-
-        Ok(self.sdmmc.resp1.read().bits())
-    }
-
-    fn card_command_long(&mut self, cmd: Command, arg: u32) -> Result<[u8; 16], Error> {
-        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
-        self.sdmmc.cmd.write(|w| unsafe {
-            w.cmdindex()
-                .bits(cmd as u8)
-                .waitresp()
-                .bits(3)
-                .cpsmen()
-                .set_bit()
-        });
-
-        self.check_command()?;
-        // This delay helps with command recognition in the logic analyzer.
-        // TODO: Remove
-        let foo = 0u32;
-        for _ in 0..0x200 { unsafe { core::ptr::read_volatile(&foo); } }
-
-        let result1 = self.sdmmc.resp1.read().bits();
-        let result2 = self.sdmmc.resp2.read().bits();
-        let result3 = self.sdmmc.resp3.read().bits();
-        let result4 = self.sdmmc.resp4.read().bits();
-
-        Ok([
-            (result1 >> 24 & 0xff) as u8,
-            (result1 >> 16 & 0xff) as u8,
-            (result1 >> 8 & 0xff) as u8,
-            (result1 & 0xff) as u8,
-            (result2 >> 24 & 0xff) as u8,
-            (result2 >> 16 & 0xff) as u8,
-            (result2 >> 8 & 0xff) as u8,
-            (result2 & 0xff) as u8,
-            (result3 >> 24 & 0xff) as u8,
-            (result3 >> 16 & 0xff) as u8,
-            (result3 >> 8 & 0xff) as u8,
-            (result3 & 0xff) as u8,
-            (result4 >> 24 & 0xff) as u8,
-            (result4 >> 16 & 0xff) as u8,
-            (result4 >> 8 & 0xff) as u8,
-            (result4 & 0xff) as u8,
-        ])
-    }
-
-    fn check_command(&mut self) -> Result<(), Error> {
-        loop {
-            let status = self.sdmmc.sta.read();
-            if status.cmdact().bit() {
-                continue;
-            } else if status.ccrcfail().bit() {
-                self.sdmmc.icr.write(|w| w.ccrcfailc().set_bit());
-                return Err(CRCFail);
-            } else if status.ctimeout().bit() {
-                self.sdmmc.icr.write(|w| w.ctimeoutc().set_bit());
-                return Err(Timeout);
-            } else if !status.cmdrend().bit() {
-                return Err(UnknownResult);
-            }
-            self.sdmmc.icr.write(|w| w.cmdrendc().set_bit());
-            return Ok(());
-        }
-    }
-
-    fn check_receive(&mut self) -> Result<(), Error> {
-        loop {
-            let status = self.sdmmc.sta.read();
-            if status.dtimeout().bit() {
-                self.sdmmc.icr.write(|w| w.dtimeoutc().set_bit());
-                return Err(Timeout);
-            } else if status.dcrcfail().bit() {
-                self.sdmmc.icr.write(|w| w.dcrcfailc().set_bit());
-                return Err(CRCFail);
-            } else if !status.dbckend().bit() {
-                continue;
-            }
-            self.sdmmc.icr.write(|w| w.dbckendc().set_bit());
-            if !status.dataend().bit() {
-                return Err(ReceiveOverrun);
-            }
-            self.sdmmc.icr.write(|w| w.dataendc().set_bit());
-            return Ok(());
-        }
-    }
-
-    pub fn card_size(&mut self) -> Result<BlockCount, Error> {
+    fn card_size(&mut self) -> Result<BlockCount, Error> {
         panic!("not implemented: card_size");
     }
 
-    /// Read a block from the SD card into memory. This function is unsafe because it writes to the
-    /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
-    /// reading or writing to it until the operation is finished.
     #[allow(unused_unsafe)]
-    pub unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error> {
+    unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> nb::Result<(), Error> {
+        self.check_ready()?;
+
         // a. Set the data length register.
         self.sdmmc
             .dlen
@@ -290,13 +264,39 @@ impl Device {
                 .set_bit()
         });
 
-        self.check_command()?;
-        self.check_receive()?;
-
+        block!(self.check_command(true))?;
+        self.state = State::Reading;
         Ok(())
     }
 
-    pub unsafe fn write_block(&mut self, _block: &Block, _address: BlockIndex) -> Result<(), Error> {
+    unsafe fn write_block(&mut self, _block: &Block, _address: BlockIndex) -> nb::Result<(), Error> {
         panic!("not implemented: write_block");
+    }
+
+    fn result(&mut self) -> nb::Result<(), Error> {
+        let status = self.sdmmc.sta.read();
+        match self.state {
+            State::Uninitialized => Err(Other(Error::Uninitialized)),
+            State::Ready => panic!("called CardHost::result without starting an operation"),
+            State::Reading if status.rxact().bit() => Err(WouldBlock),
+            State::Writing if status.txact().bit() => Err(WouldBlock),
+            State::Reading | State::Writing => Ok(()),
+        }?;
+
+        self.sdmmc.icr.write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
+        self.state = State::Ready;
+        if status.dcrcfail().bit() {
+            Err(Other(CRCFail))
+        } else if status.dtimeout().bit() {
+            Err(Other(Timeout))
+        } else if status.rxoverr().bit() {
+            Err(Other(ReceiveOverrun))
+        } else if status.txunderr().bit() {
+            Err(Other(SendUnderrun))
+        } else if !status.dataend().bit() || !status.dbckend().bit() {
+            Err(Other(UnknownResult))
+        } else {
+            Ok(())
+        }
     }
 }

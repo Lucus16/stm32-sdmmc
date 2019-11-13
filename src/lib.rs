@@ -7,12 +7,23 @@ pub struct BlockIndex(u32);
 
 #[derive(Copy, Clone, Debug)]
 pub enum Error {
+    /// The card host has not yet been initialized, call .init() first.
+    Uninitialized,
+    /// The DMA peripheral could not keep up with the card during a read. Adjust the relative clock
+    /// speeds.
     ReceiveOverrun,
+    /// The DMA peripheral could not keep up with the card during a write. Adjust the relative
+    /// clock speeds.
     SendUnderrun,
+    /// A command or IO operation timed out. Try to reinitialize by calling .init() again.
     Timeout,
+    /// A CRC check failed for a command or IO operation. Retry the operation.
     CRCFail,
+    /// The card does not support the supplied voltage.
     OperatingConditionsNotSupported,
-    ResponseToOtherCommand,
+    /// The card gave an unexpected response.
+    UnexpectedResponse,
+    /// The operation did not succeed and the card host did not indicate why.
     UnknownResult,
 }
 
@@ -43,7 +54,22 @@ pub enum AppCommand {
 }
 
 pub trait CardHost {
-    fn init(&self) -> Result<(), Error>;
-    unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error>;
-    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> Result<(), Error>;
+    /// Initialize the SD card and the DMA channel.
+    fn init(&mut self) -> Result<(), Error>;
+
+    /// Return the card size in blocks.
+    fn card_size(&mut self) -> Result<BlockCount, Error>;
+
+    /// Read a block from the SD card into memory. This function is unsafe because it writes to the
+    /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
+    /// reading or writing to it until the operation is finished.
+    unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> nb::Result<(), Error>;
+
+    /// Write a block from the SD card into memory. This function is unsafe because it reads from the
+    /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
+    /// writing to it until the operation is finished.
+    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> nb::Result<(), Error>;
+
+    /// Check the result of a read or write operation.
+    fn result(&mut self) -> nb::Result<(), Error>;
 }
