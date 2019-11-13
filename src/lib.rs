@@ -44,6 +44,7 @@ pub enum Command {
     SEND_CSD = 9,
     SEND_CID = 10,
     READ_BLOCK = 17,
+    WRITE_BLOCK = 24,
     APP_COMMAND = 55,
 }
 

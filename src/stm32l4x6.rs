@@ -161,6 +161,9 @@ impl CardHost for Device {
         self.sdmmc.clkcr.modify(|_, w| w.clken().set_bit());
         // TODO: Test enabling PWRSAV here.
 
+        // Set the data timeout.
+        self.sdmmc.dtimer.write(|w| unsafe { w.bits(0x2000) });
+
         // Select sdmmc for dma 2 channel 4.
         self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
 
@@ -203,9 +206,7 @@ impl CardHost for Device {
         // a. Set the data length register.
         self.sdmmc
             .dlen
-            .write(|w| unsafe { w.bits(block.len() as u32 as u32) });
-        // Set the data timeout.
-        self.sdmmc.dtimer.write(|w| unsafe { w.bits(0x2000) });
+            .write(|w| unsafe { w.bits(block.len() as u32) });
 
         // b. Set the dma channel.
         //    - Set the channel source address.
@@ -241,8 +242,6 @@ impl CardHost for Device {
                 .set_bit()
                 .dtdir()
                 .set_bit()
-                .dtmode()
-                .clear_bit()
                 .dmaen()
                 .set_bit()
                 .dblocksize()
@@ -250,27 +249,68 @@ impl CardHost for Device {
         });
 
         // d. Set the address.
-        self.sdmmc
-            .arg
-            .write(|w| unsafe { w.bits(address.0) });
-
         // e. Set the command register.
-        self.sdmmc.cmd.write(|w| unsafe {
-            w.cmdindex()
-                .bits(Command::READ_BLOCK as u8)
-                .waitresp()
-                .bits(1)
-                .cpsmen()
-                .set_bit()
-        });
-
-        block!(self.check_command(true))?;
+        self.card_command_short(Command::READ_BLOCK, address.0)?;
         self.state = State::Reading;
         Ok(())
     }
 
-    unsafe fn write_block(&mut self, _block: &Block, _address: BlockIndex) -> nb::Result<(), Error> {
-        panic!("not implemented: write_block");
+    #[allow(unused_unsafe)]
+    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> nb::Result<(), Error> {
+        self.check_ready()?;
+
+        // a. Set the data length register.
+        self.sdmmc
+            .dlen
+            .write(|w| unsafe { w.bits(block.len() as u32) });
+
+        // b. Set the dma channel.
+        //    - Set the channel source address.
+        self.dma
+            .cmar4
+            .write(|w| unsafe { w.bits(block as *const Block as u32) });
+        //    - Set the channel destination address.
+        self.dma
+            .cpar4
+            .write(|w| unsafe { w.bits(SDMMC1_ADDRESS + FIFO_OFFSET) });
+        //    - Set the number of words to transfer.
+        self.dma.cndtr4.write(|w| w.ndt().bits(0x80));
+
+        //    - Set the word size, direction and increments.
+        self.dma.ccr4.write(|w| {
+            w.dir()
+                .set_bit()
+                .minc()
+                .set_bit()
+                .pinc()
+                .clear_bit()
+                .msize()
+                .bits32()
+                .psize()
+                .bits32()
+        });
+
+        //    - Enable the channel.
+        self.dma.ccr4.modify(|_, w| w.en().set_bit());
+
+        // c. Set the address.
+        // d. Set the command register.
+        self.card_command_short(Command::WRITE_BLOCK, address.0)?;
+        self.state = State::Writing;
+
+        // e. Set the data control register:
+        self.sdmmc.dctrl.write(|w| unsafe {
+            w.dten()
+                .set_bit()
+                .dtdir()
+                .clear_bit()
+                .dmaen()
+                .set_bit()
+                .dblocksize()
+                .bits(0x9)
+        });
+
+        Ok(())
     }
 
     fn result(&mut self) -> nb::Result<(), Error> {
