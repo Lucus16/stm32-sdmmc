@@ -1,9 +1,11 @@
 use stm32l4::stm32l4x6 as stm32;
 
-use crate::{AppCommand, Block, BlockCount, BlockIndex, CardHost, CardVersion, Command, Error};
 use crate::Error::*;
-use nb::Error::{Other, WouldBlock};
+use crate::{
+    AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error, CSD,
+};
 use nb::block;
+use nb::Error::{Other, WouldBlock};
 
 const SDMMC1_ADDRESS: u32 = 0x4001_2800;
 const FIFO_OFFSET: u32 = 0x80;
@@ -21,18 +23,58 @@ enum State {
 pub struct Device {
     sdmmc: stm32::SDMMC1,
     dma: stm32::DMA2,
+    config: Config,
     state: State,
     rca: u32,
+    csd: CSD,
+    card_version: CardVersion,
+}
+
+pub struct Config {
+    /// The width of the data bus in bits, either one or four.
+    pub bus_width: BusWidth,
+    /// Value to divide the clock speed by. Zero or one means bypass clock divider.
+    pub clock_divider: u8,
+    /// The number of clock cycles to wait for data transfer to complete.
+    pub data_timeout: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            bus_width: BusWidth::Bits1,
+            clock_divider: 4,
+            data_timeout: 0x1000000,
+        }
+    }
 }
 
 impl Device {
-    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2) -> Device {
+    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, config: Config) -> Device {
         Device {
             sdmmc: sdmmc,
             dma: dma,
+            config: config,
             state: State::Uninitialized,
             rca: 0,
+            csd: CSD::V1([0; 4]),
+            card_version: CardVersion::V1SC,
         }
+    }
+
+    /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
+    /// still ongoing.
+    pub fn free(self) -> (stm32::SDMMC1, stm32::DMA2) {
+        match self.state {
+            State::Uninitialized | State::Ready => (self.sdmmc, self.dma),
+            State::Reading | State::Writing => {
+                panic!("attempt to free card host while still in use")
+            }
+        }
+    }
+
+    pub fn status(&self) -> u32 {
+        self.sdmmc.sta.read().bits()
     }
 
     fn check_operating_conditions(&mut self) -> Result<(), Error> {
@@ -64,9 +106,10 @@ impl Device {
         Ok(self.sdmmc.resp1.read().bits())
     }
 
-    fn acmd41(&mut self) -> Result<u32, Error> {
+    fn acmd41(&mut self, hcs: bool) -> Result<u32, Error> {
         self.card_command_short(Command::APP_COMMAND, 0)?;
-        self.sdmmc.arg.write(|w| unsafe { w.bits(0x4010_0000) });
+        let arg = 0x0010_0000 | (hcs as u32) << 30;
+        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
         self.sdmmc.cmd.write(|w| unsafe {
             w.cmdindex()
                 .bits(AppCommand::SD_SEND_OP_COND as u8)
@@ -133,7 +176,11 @@ impl Device {
         // This delay helps with command recognition in the logic analyzer.
         // TODO: Remove
         let foo = 0u32;
-        for _ in 0..0x1000 { unsafe { core::ptr::read_volatile(&foo); } }
+        for _ in 0..0x1000 {
+            unsafe {
+                core::ptr::read_volatile(&foo);
+            }
+        }
 
         Ok([
             self.sdmmc.resp1.read().bits(),
@@ -156,7 +203,9 @@ impl Device {
         if status.cmdact().bit() {
             return Err(WouldBlock);
         }
-        self.sdmmc.icr.write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
+        self.sdmmc
+            .icr
+            .write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
         if status.ccrcfail().bit() {
             Err(Other(CRCFail))
         } else if status.ctimeout().bit() {
@@ -174,16 +223,18 @@ impl Device {
 impl CardHost for Device {
     fn init(&mut self) -> Result<(), Error> {
         // Enable power, then clock.
-        self.sdmmc.clkcr.modify(|_, w| unsafe {
-            w.clkdiv().bits(0x7e)
-                .pwrsav().set_bit()
-                .clken().clear_bit()
-        });
-        self.sdmmc.power.modify(|_, w| unsafe { w.pwrctrl().bits(3) });
+        self.sdmmc
+            .clkcr
+            .modify(|_, w| unsafe { w.clkdiv().bits(0x7e).pwrsav().set_bit().clken().clear_bit() });
+        self.sdmmc
+            .power
+            .modify(|_, w| unsafe { w.pwrctrl().bits(3) });
         self.sdmmc.clkcr.modify(|_, w| w.clken().set_bit());
 
         // Set the data timeout.
-        self.sdmmc.dtimer.write(|w| unsafe { w.bits(0x1000000) });
+        self.sdmmc
+            .dtimer
+            .write(|w| unsafe { w.bits(self.config.data_timeout) });
 
         // Select sdmmc for dma 2 channel 4.
         self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
@@ -192,24 +243,61 @@ impl CardHost for Device {
         self.card_command_none(Command::GO_IDLE_STATE, 0)?;
 
         // Determine card version.
-        let _version = match self.check_operating_conditions() {
-            Err(Timeout) => CardVersion::V1,
-            Ok(_) => CardVersion::V2,
-            e => return e
+        let v2 = match self.check_operating_conditions() {
+            Err(Timeout) => false,
+            Ok(_) => true,
+            e => return e,
         };
 
         // idle -> ready
-        let mut busy = true;
-        while busy {
-            busy = self.acmd41()? >> 31 == 0;
-        }
+        let ccs = loop {
+            let result = self.acmd41(v2)?;
+            if result >> 31 != 0 {
+                break (result >> 30) & 1 != 0;
+            }
+        };
+
+        self.card_version = match (v2, ccs) {
+            (false, _) => CardVersion::V1SC,
+            (true, false) => CardVersion::V2SC,
+            (true, true) => CardVersion::V2HC,
+        };
+
         // ready -> ident
         self.card_command_long(Command::ALL_SEND_CID, 0)?;
         // ident -> stby
         let card_rca_status = self.card_command_short(Command::SEND_RELATIVE_ADDR, 0)?;
         self.rca = card_rca_status & 0xffff_0000;
+        let csd = self.card_command_long(Command::SEND_CSD, self.rca)?;
+        self.csd = match self.card_version {
+            CardVersion::V1SC | CardVersion::V2SC => CSD::V1(csd),
+            CardVersion::V2HC => CSD::V2(csd),
+        };
         // stby -> tran
         self.card_command_short(Command::SELECT_CARD, self.rca)?;
+
+        match self.config.bus_width {
+            BusWidth::Bits1 => {
+                self.app_command_short(AppCommand::SET_BUS_WIDTH, 0)?;
+                self.sdmmc
+                    .clkcr
+                    .modify(|_, w| unsafe { w.widbus().bits(0) });
+            }
+            BusWidth::Bits4 => {
+                self.app_command_short(AppCommand::SET_BUS_WIDTH, 2)?;
+                self.sdmmc
+                    .clkcr
+                    .modify(|_, w| unsafe { w.widbus().bits(1) });
+            }
+        }
+
+        if self.config.clock_divider < 2 {
+            self.sdmmc.clkcr.modify(|_, w| w.bypass().set_bit());
+        } else {
+            self.sdmmc
+                .clkcr
+                .modify(|_, w| unsafe { w.clkdiv().bits(self.config.clock_divider - 2) });
+        }
 
         self.state = State::Ready;
 
@@ -217,7 +305,10 @@ impl CardHost for Device {
     }
 
     fn card_size(&mut self) -> Result<BlockCount, Error> {
-        panic!("not implemented: card_size");
+        match self.state {
+            State::Uninitialized => Err(Error::Uninitialized),
+            _ => Ok(self.csd.capacity()),
+        }
     }
 
     #[allow(unused_unsafe)]
@@ -230,6 +321,8 @@ impl CardHost for Device {
             .write(|w| unsafe { w.bits(block.len() as u32) });
 
         // b. Set the dma channel.
+        //    - Clear any pending interrupts.
+        self.dma.ifcr.write(|w| w.cgif4().set_bit());
         //    - Set the channel source address.
         self.dma
             .cmar4
@@ -345,7 +438,9 @@ impl CardHost for Device {
         }?;
 
         self.dma.ccr4.modify(|_, w| w.en().clear_bit());
-        self.sdmmc.icr.write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
+        self.sdmmc
+            .icr
+            .write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
         self.state = State::Ready;
         if status.dcrcfail().bit() {
             Err(Other(CRCFail))

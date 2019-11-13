@@ -3,7 +3,11 @@
 pub mod stm32l4x6;
 
 pub type Block = [u8; 512];
+
+#[derive(Copy, Clone, Debug)]
 pub struct BlockCount(u32);
+
+#[derive(Copy, Clone, Debug)]
 pub struct BlockIndex(u32);
 
 impl BlockIndex {
@@ -38,8 +42,9 @@ pub enum Error {
 
 #[derive(Copy, Clone, Debug)]
 pub enum CardVersion {
-    V1,
-    V2,
+    V1SC,
+    V2SC,
+    V2HC,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -62,6 +67,34 @@ pub enum Command {
 pub enum AppCommand {
     SET_BUS_WIDTH = 6,
     SD_SEND_OP_COND = 41,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum BusWidth {
+    Bits1,
+    Bits4,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum CSD {
+    V1([u32; 4]),
+    V2([u32; 4]),
+}
+
+impl CSD {
+    fn capacity(&self) -> BlockCount {
+        BlockCount(match self {
+            CSD::V1(words) => {
+                let c_size = (words[2] >> 30 | (words[1] & 0x3ff) << 2) + 1;
+                let c_size_mult = ((words[2] & 0x0003_8000) >> 15) + 2;
+                c_size << c_size_mult
+            }
+            CSD::V2(words) => {
+                let c_size = (words[2] >> 16) + 1;
+                c_size << 10
+            }
+        })
+    }
 }
 
 pub trait CardHost {
