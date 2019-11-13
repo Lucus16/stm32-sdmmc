@@ -22,6 +22,7 @@ pub struct Device {
     sdmmc: stm32::SDMMC1,
     dma: stm32::DMA2,
     state: State,
+    rca: u32,
 }
 
 impl Device {
@@ -30,6 +31,7 @@ impl Device {
             sdmmc: sdmmc,
             dma: dma,
             state: State::Uninitialized,
+            rca: 0,
         }
     }
 
@@ -44,6 +46,22 @@ impl Device {
                 }
             }
         }
+    }
+
+    fn app_command_short(&mut self, cmd: AppCommand, arg: u32) -> Result<u32, Error> {
+        self.card_command_short(Command::APP_COMMAND, self.rca)?;
+        self.sdmmc.arg.write(|w| unsafe { w.bits(arg) });
+        self.sdmmc.cmd.write(|w| unsafe {
+            w.cmdindex()
+                .bits(cmd as u8)
+                .waitresp()
+                .bits(1)
+                .cpsmen()
+                .set_bit()
+        });
+
+        block!(self.check_command(true))?;
+        Ok(self.sdmmc.resp1.read().bits())
     }
 
     fn acmd41(&mut self) -> Result<u32, Error> {
@@ -115,7 +133,7 @@ impl Device {
         // This delay helps with command recognition in the logic analyzer.
         // TODO: Remove
         let foo = 0u32;
-        for _ in 0..0x200 { unsafe { core::ptr::read_volatile(&foo); } }
+        for _ in 0..0x1000 { unsafe { core::ptr::read_volatile(&foo); } }
 
         Ok([
             self.sdmmc.resp1.read().bits(),
@@ -125,11 +143,11 @@ impl Device {
         ])
     }
 
-    fn check_ready(&mut self) -> nb::Result<(), Error> {
+    fn check_ready(&mut self) -> Result<(), Error> {
         match self.state {
-            State::Uninitialized => Err(Other(Error::Uninitialized)),
+            State::Uninitialized => Err(Error::Uninitialized),
             State::Ready => Ok(()),
-            State::Reading | State::Writing => Err(WouldBlock),
+            State::Reading | State::Writing => Err(Error::Busy),
         }
     }
 
@@ -156,13 +174,16 @@ impl Device {
 impl CardHost for Device {
     fn init(&mut self) -> Result<(), Error> {
         // Enable power, then clock.
-        self.sdmmc.clkcr.modify(|_, w| unsafe { w.clkdiv().bits(0x7e).clken().clear_bit() });
+        self.sdmmc.clkcr.modify(|_, w| unsafe {
+            w.clkdiv().bits(0x7e)
+                .pwrsav().set_bit()
+                .clken().clear_bit()
+        });
         self.sdmmc.power.modify(|_, w| unsafe { w.pwrctrl().bits(3) });
         self.sdmmc.clkcr.modify(|_, w| w.clken().set_bit());
-        // TODO: Test enabling PWRSAV here.
 
         // Set the data timeout.
-        self.sdmmc.dtimer.write(|w| unsafe { w.bits(0x2000) });
+        self.sdmmc.dtimer.write(|w| unsafe { w.bits(0x1000000) });
 
         // Select sdmmc for dma 2 channel 4.
         self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
@@ -186,9 +207,9 @@ impl CardHost for Device {
         self.card_command_long(Command::ALL_SEND_CID, 0)?;
         // ident -> stby
         let card_rca_status = self.card_command_short(Command::SEND_RELATIVE_ADDR, 0)?;
-        let relative_card_address = card_rca_status >> 0x10;
+        self.rca = card_rca_status & 0xffff_0000;
         // stby -> tran
-        self.card_command_short(Command::SELECT_CARD, relative_card_address << 16)?;
+        self.card_command_short(Command::SELECT_CARD, self.rca)?;
 
         self.state = State::Ready;
 
@@ -200,7 +221,7 @@ impl CardHost for Device {
     }
 
     #[allow(unused_unsafe)]
-    unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> nb::Result<(), Error> {
+    unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error> {
         self.check_ready()?;
 
         // a. Set the data length register.
@@ -256,7 +277,7 @@ impl CardHost for Device {
     }
 
     #[allow(unused_unsafe)]
-    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> nb::Result<(), Error> {
+    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> Result<(), Error> {
         self.check_ready()?;
 
         // a. Set the data length register.
@@ -323,6 +344,7 @@ impl CardHost for Device {
             State::Reading | State::Writing => Ok(()),
         }?;
 
+        self.dma.ccr4.modify(|_, w| w.en().clear_bit());
         self.sdmmc.icr.write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
         self.state = State::Ready;
         if status.dcrcfail().bit() {
