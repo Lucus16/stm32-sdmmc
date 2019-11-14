@@ -7,6 +7,10 @@ use crate::{
 use nb::block;
 use nb::Error::{Other, WouldBlock};
 
+use stm32l4xx_hal::gpio::gpioc::{PC8, PC9, PC10, PC11, PC12};
+use stm32l4xx_hal::gpio::gpiod::PD2;
+use stm32l4xx_hal::gpio::{AF12, Alternate};
+
 const SDMMC1_ADDRESS: u32 = 0x4001_2800;
 const FIFO_OFFSET: u32 = 0x80;
 const SEND_IF_COND_PATTERN: u32 = 0x0000_01aa;
@@ -23,6 +27,7 @@ enum State {
 pub struct Device {
     sdmmc: stm32::SDMMC1,
     dma: stm32::DMA2,
+    pins: Pins,
     config: Config,
     state: State,
     rca: u32,
@@ -50,10 +55,11 @@ impl Default for Config {
 }
 
 impl Device {
-    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, config: Config) -> Device {
+    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, pins: Pins, config: Config) -> Device {
         Device {
             sdmmc: sdmmc,
             dma: dma,
+            pins: pins,
             config: config,
             state: State::Uninitialized,
             rca: 0,
