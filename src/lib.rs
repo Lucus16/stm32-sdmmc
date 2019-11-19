@@ -6,8 +6,7 @@ pub use stm32l4x6::{Config, Device, Pins};
 
 pub type Block = [u8; 512];
 
-#[derive(Copy, Clone, Debug)]
-pub struct BlockCount(u32);
+pub type BlockCount = u32;
 
 #[derive(Copy, Clone, Debug)]
 pub struct BlockIndex(u32);
@@ -15,6 +14,53 @@ pub struct BlockIndex(u32);
 impl BlockIndex {
     pub fn new(index: u32) -> BlockIndex {
         BlockIndex(index)
+    }
+}
+
+impl core::ops::Add<BlockCount> for BlockIndex {
+    type Output = BlockIndex;
+    fn add(self, other: BlockCount) -> BlockIndex {
+        BlockIndex(self.0 + other)
+    }
+}
+
+impl core::ops::Add<BlockIndex> for BlockCount {
+    type Output = BlockIndex;
+    fn add(self, other: BlockIndex) -> BlockIndex {
+        BlockIndex(self + other.0)
+    }
+}
+
+impl core::ops::AddAssign<BlockCount> for BlockIndex {
+    fn add_assign(&mut self, other: BlockCount) {
+        self.0 += other
+    }
+}
+
+impl core::ops::Sub<BlockIndex> for BlockIndex {
+    type Output = BlockCount;
+    fn sub(self, other: BlockIndex) -> BlockCount {
+        self.0 - other.0
+    }
+}
+
+impl core::ops::Sub<BlockCount> for BlockIndex {
+    type Output = BlockIndex;
+    fn sub(self, other: BlockCount) -> BlockIndex {
+        BlockIndex(self.0 - other)
+    }
+}
+
+impl core::ops::Sub<BlockIndex> for BlockCount {
+    type Output = BlockIndex;
+    fn sub(self, other: BlockIndex) -> BlockIndex {
+        BlockIndex(self - other.0)
+    }
+}
+
+impl core::ops::SubAssign<BlockCount> for BlockIndex {
+    fn sub_assign(&mut self, other: BlockCount) {
+        self.0 -= other
     }
 }
 
@@ -85,7 +131,7 @@ enum CSD {
 
 impl CSD {
     fn capacity(&self) -> BlockCount {
-        BlockCount(match self {
+        match self {
             CSD::V1(words) => {
                 let c_size = (words[2] >> 30 | (words[1] & 0x3ff) << 2) + 1;
                 let c_size_mult = ((words[2] & 0x0003_8000) >> 15) + 2;
@@ -95,7 +141,7 @@ impl CSD {
                 let c_size = (words[2] >> 16) + 1;
                 c_size << 10
             }
-        })
+        }
     }
 }
 
