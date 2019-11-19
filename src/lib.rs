@@ -1,6 +1,8 @@
 #![no_std]
 #[cfg(feature = "stm32l4x6")]
-pub mod stm32l4x6;
+mod stm32l4x6;
+#[cfg(feature = "stm32l4x6")]
+pub use stm32l4x6::{Config, Device, Pins};
 
 pub type Block = [u8; 512];
 

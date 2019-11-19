@@ -1,4 +1,4 @@
-use stm32l4::stm32l4x6 as stm32;
+use stm32l4xx_hal::stm32;
 
 use crate::Error::*;
 use crate::{
@@ -12,6 +12,16 @@ const FIFO_OFFSET: u32 = 0x80;
 const SEND_IF_COND_PATTERN: u32 = 0x0000_01aa;
 const STATUS_ERROR_MASK: u32 = 0x0000_05ff;
 
+use stm32l4xx_hal::gpio;
+type Pin = gpio::Alternate<gpio::AF12, gpio::Input<gpio::Floating>>;
+type ClockPin = gpio::gpioc::PC12<Pin>;
+type CommandPin = gpio::gpiod::PD2<Pin>;
+type Data0Pin = gpio::gpioc::PC8<Pin>;
+type Data1Pin = gpio::gpioc::PC9<Pin>;
+type Data2Pin = gpio::gpioc::PC10<Pin>;
+type Data3Pin = gpio::gpioc::PC11<Pin>;
+pub type Pins = (ClockPin, CommandPin, Data0Pin, Data1Pin, Data2Pin, Data3Pin);
+
 #[derive(Copy, Clone, Debug)]
 enum State {
     Uninitialized,
@@ -23,6 +33,7 @@ enum State {
 pub struct Device {
     sdmmc: stm32::SDMMC1,
     dma: stm32::DMA2,
+    pins: Pins,
     config: Config,
     state: State,
     rca: u32,
@@ -50,11 +61,12 @@ impl Default for Config {
 }
 
 impl Device {
-    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, config: Config) -> Device {
+    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, pins: Pins, config: Config) -> Device {
         Device {
-            sdmmc: sdmmc,
-            dma: dma,
-            config: config,
+            sdmmc,
+            dma,
+            pins,
+            config,
             state: State::Uninitialized,
             rca: 0,
             csd: CSD::V1([0; 4]),
@@ -64,9 +76,9 @@ impl Device {
 
     /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
     /// still ongoing.
-    pub fn free(self) -> (stm32::SDMMC1, stm32::DMA2) {
+    pub fn free(self) -> (stm32::SDMMC1, stm32::DMA2, Pins) {
         match self.state {
-            State::Uninitialized | State::Ready => (self.sdmmc, self.dma),
+            State::Uninitialized | State::Ready => (self.sdmmc, self.dma, self.pins),
             State::Reading | State::Writing => {
                 panic!("attempt to free card host while still in use")
             }
