@@ -15,6 +15,10 @@ impl BlockIndex {
     pub fn new(index: u32) -> BlockIndex {
         BlockIndex(index)
     }
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 impl core::ops::Add<BlockCount> for BlockIndex {
