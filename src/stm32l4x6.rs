@@ -2,7 +2,7 @@ use stm32l4xx_hal::stm32;
 
 use crate::Error::*;
 use crate::{
-    AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error, CSD,
+    AppCommand, BLOCK_SIZE, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error, CSD,
 };
 use nb::block;
 use nb::Error::{Other, WouldBlock};
@@ -235,9 +235,10 @@ impl Device {
 impl CardHost for Device {
     fn init(&mut self) -> Result<(), Error> {
         // Enable power, then clock.
-        self.sdmmc
-            .clkcr
-            .modify(|_, w| unsafe { w.clkdiv().bits(0x7e).pwrsav().set_bit().clken().clear_bit() });
+        self.sdmmc.clkcr.modify(|_, w| unsafe {
+            w.negedge().set_bit().clkdiv().bits(0x7e).pwrsav().set_bit().clken().clear_bit()
+        });
+
         self.sdmmc
             .power
             .modify(|_, w| unsafe { w.pwrctrl().bits(3) });
@@ -382,25 +383,27 @@ impl CardHost for Device {
     }
 
     #[allow(unused_unsafe)]
-    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> Result<(), Error> {
+    unsafe fn write_blocks(&mut self, blocks: &[Block], address: BlockIndex) -> Result<(), Error> {
         self.check_ready()?;
+
+        self.card_command_short(Command::SET_BLOCK_COUNT, blocks.len() as u32)?;
 
         // a. Set the data length register.
         self.sdmmc
             .dlen
-            .write(|w| unsafe { w.bits(block.len() as u32) });
+            .write(|w| unsafe { w.bits((blocks.len() * BLOCK_SIZE) as u32) });
 
         // b. Set the dma channel.
         //    - Set the channel source address.
         self.dma
             .cmar4
-            .write(|w| unsafe { w.bits(block as *const Block as u32) });
+            .write(|w| unsafe { w.bits(blocks as *const [Block] as *const Block as u32) });
         //    - Set the channel destination address.
         self.dma
             .cpar4
             .write(|w| unsafe { w.bits(SDMMC1_ADDRESS + FIFO_OFFSET) });
         //    - Set the number of words to transfer.
-        self.dma.cndtr4.write(|w| w.ndt().bits(0x80));
+        self.dma.cndtr4.write(|w| w.ndt().bits(blocks.len() as u16 * 0x80));
 
         //    - Set the word size, direction and increments.
         self.dma.ccr4.write(|w| {
@@ -421,7 +424,7 @@ impl CardHost for Device {
 
         // c. Set the address.
         // d. Set the command register.
-        self.card_command_short(Command::WRITE_BLOCK, address.0)?;
+        self.card_command_short(Command::WRITE_MULTIPLE_BLOCK, address.0)?;
         self.state = State::Writing;
 
         // e. Set the data control register:

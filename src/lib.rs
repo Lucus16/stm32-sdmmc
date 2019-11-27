@@ -4,7 +4,9 @@ mod stm32l4x6;
 #[cfg(feature = "stm32l4x6")]
 pub use stm32l4x6::{Config, Device, Pins};
 
-pub type Block = [u8; 512];
+pub const BLOCK_SIZE: usize = 0x200;
+
+pub type Block = [u8; BLOCK_SIZE];
 
 pub type BlockCount = u32;
 
@@ -110,7 +112,10 @@ pub enum Command {
     SEND_CSD = 9,
     SEND_CID = 10,
     READ_BLOCK = 17,
+    READ_MULTIPLE_BLOCK = 18,
+    SET_BLOCK_COUNT = 23,
     WRITE_BLOCK = 24,
+    WRITE_MULTIPLE_BLOCK = 25,
     APP_COMMAND = 55,
 }
 
@@ -164,7 +169,7 @@ pub trait CardHost {
     /// Write a block from the SD card into memory. This function is unsafe because it reads from the
     /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
     /// writing to it until the operation is finished.
-    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> Result<(), Error>;
+    unsafe fn write_blocks(&mut self, blocks: &[Block], address: BlockIndex) -> Result<(), Error>;
 
     /// Check the result of a read or write operation.
     fn result(&mut self) -> nb::Result<(), Error>;
