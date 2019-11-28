@@ -2,7 +2,8 @@ use stm32l4xx_hal::stm32;
 
 use crate::Error::*;
 use crate::{
-    AppCommand, BLOCK_SIZE, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error, CSD,
+    AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error,
+    BLOCK_SIZE, CSD,
 };
 use nb::block;
 use nb::Error::{Other, WouldBlock};
@@ -230,14 +231,24 @@ impl Device {
             Ok(())
         }
     }
+
+    fn set_clock_divider(&mut self, value: u8) {
+        if value < 2 {
+            self.sdmmc.clkcr.modify(|_, w| w.bypass().set_bit());
+        } else {
+            self.sdmmc
+                .clkcr
+                .modify(|_, w| unsafe { w.clkdiv().bits(value - 2) });
+        }
+    }
 }
 
 impl CardHost for Device {
-    fn init(&mut self) -> Result<(), Error> {
+    fn init(&mut self) {
         // Enable power, then clock.
-        self.sdmmc.clkcr.modify(|_, w| unsafe {
-            w.negedge().set_bit().clkdiv().bits(0x7e).pwrsav().set_bit().clken().clear_bit()
-        });
+        self.sdmmc
+            .clkcr
+            .modify(|_, w| w.negedge().set_bit().pwrsav().set_bit().clken().clear_bit());
 
         self.sdmmc
             .power
@@ -251,6 +262,10 @@ impl CardHost for Device {
 
         // Select sdmmc for dma 2 channel 4.
         self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
+    }
+
+    fn init_card(&mut self) -> Result<(), Error> {
+        self.set_clock_divider(0x80);
 
         // * -> idle
         self.card_command_none(Command::GO_IDLE_STATE, 0)?;
@@ -304,13 +319,7 @@ impl CardHost for Device {
             }
         }
 
-        if self.config.clock_divider < 2 {
-            self.sdmmc.clkcr.modify(|_, w| w.bypass().set_bit());
-        } else {
-            self.sdmmc
-                .clkcr
-                .modify(|_, w| unsafe { w.clkdiv().bits(self.config.clock_divider - 2) });
-        }
+        self.set_clock_divider(self.config.clock_divider);
 
         self.state = State::Ready;
 
@@ -403,7 +412,9 @@ impl CardHost for Device {
             .cpar4
             .write(|w| unsafe { w.bits(SDMMC1_ADDRESS + FIFO_OFFSET) });
         //    - Set the number of words to transfer.
-        self.dma.cndtr4.write(|w| w.ndt().bits(blocks.len() as u16 * 0x80));
+        self.dma
+            .cndtr4
+            .write(|w| w.ndt().bits(blocks.len() as u16 * 0x80));
 
         //    - Set the word size, direction and increments.
         self.dma.ccr4.write(|w| {

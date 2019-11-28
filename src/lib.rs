@@ -123,6 +123,7 @@ pub enum Command {
 #[allow(non_camel_case_types)]
 pub enum AppCommand {
     SET_BUS_WIDTH = 6,
+    SET_WR_BLK_ERASE_COUNT = 23,
     SD_SEND_OP_COND = 41,
 }
 
@@ -155,8 +156,10 @@ impl CSD {
 }
 
 pub trait CardHost {
-    /// Initialize the SD card and the DMA channel.
-    fn init(&mut self) -> Result<(), Error>;
+    /// Initialize the card host and the dma channel.
+    fn init(&mut self);
+    /// Initialize the SD card. The card host must be initialized first.
+    fn init_card(&mut self) -> Result<(), Error>;
 
     /// Return the card size in blocks.
     fn card_size(&mut self) -> Result<BlockCount, Error>;
