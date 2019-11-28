@@ -156,10 +156,8 @@ impl CSD {
 }
 
 pub trait CardHost {
-    /// Initialize the card host and the dma channel.
-    fn init(&mut self);
-    /// Initialize the SD card. The card host must be initialized first.
-    fn init_card(&mut self) -> Result<(), Error>;
+    /// Initialize the SD card.
+    fn init_card(&mut self) -> nb::Result<(), Error>;
 
     /// Return the card size in blocks.
     fn card_size(&mut self) -> Result<BlockCount, Error>;

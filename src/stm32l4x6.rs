@@ -26,6 +26,7 @@ pub type Pins = (ClockPin, CommandPin, Data0Pin, Data1Pin, Data2Pin, Data3Pin);
 #[derive(Copy, Clone, Debug)]
 enum State {
     Uninitialized,
+    Init1(bool),
     Ready,
     Reading,
     Writing,
@@ -38,6 +39,7 @@ pub struct Device {
     config: Config,
     state: State,
     rca: u32,
+    /// Card Specific Data
     csd: CSD,
     card_version: CardVersion,
 }
@@ -78,12 +80,41 @@ impl Device {
     /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
     /// still ongoing.
     pub fn free(self) -> (stm32::SDMMC1, stm32::DMA2, Pins) {
+        use State::*;
         match self.state {
-            State::Uninitialized | State::Ready => (self.sdmmc, self.dma, self.pins),
-            State::Reading | State::Writing => {
+            Uninitialized | Init1(_) | Ready => (self.sdmmc, self.dma, self.pins),
+            Reading | Writing => {
                 panic!("attempt to free card host while still in use")
             }
         }
+    }
+
+    fn init_peri(&mut self, clock_divider: u8) {
+        // Enable power, then clock.
+        self.sdmmc
+            .clkcr
+            .modify(|_, w| w.negedge().set_bit().pwrsav().set_bit().clken().clear_bit());
+
+        if clock_divider < 2 {
+            self.sdmmc.clkcr.modify(|_, w| w.bypass().set_bit());
+        } else {
+            self.sdmmc
+                .clkcr
+                .modify(|_, w| unsafe { w.clkdiv().bits(clock_divider - 2) });
+        }
+
+        self.sdmmc
+            .power
+            .modify(|_, w| unsafe { w.pwrctrl().bits(3) });
+        self.sdmmc.clkcr.modify(|_, w| w.clken().set_bit());
+
+        // Set the data timeout.
+        self.sdmmc
+            .dtimer
+            .write(|w| unsafe { w.bits(self.config.data_timeout) });
+
+        // Select sdmmc for dma 2 channel 4.
+        self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
     }
 
     pub fn status(&self) -> u32 {
@@ -204,10 +235,12 @@ impl Device {
     }
 
     fn check_ready(&mut self) -> Result<(), Error> {
+        self.init_peri(self.config.clock_divider);
+        use State::*;
         match self.state {
-            State::Uninitialized => Err(Error::Uninitialized),
-            State::Ready => Ok(()),
-            State::Reading | State::Writing => Err(Error::Busy),
+            Uninitialized | Init1(_) => Err(Error::Uninitialized),
+            Ready => Ok(()),
+            Reading | Writing => Err(Error::Busy),
         }
     }
 
@@ -231,104 +264,87 @@ impl Device {
             Ok(())
         }
     }
-
-    fn set_clock_divider(&mut self, value: u8) {
-        if value < 2 {
-            self.sdmmc.clkcr.modify(|_, w| w.bypass().set_bit());
-        } else {
-            self.sdmmc
-                .clkcr
-                .modify(|_, w| unsafe { w.clkdiv().bits(value - 2) });
-        }
-    }
 }
 
 impl CardHost for Device {
-    fn init(&mut self) {
-        // Enable power, then clock.
-        self.sdmmc
-            .clkcr
-            .modify(|_, w| w.negedge().set_bit().pwrsav().set_bit().clken().clear_bit());
-
-        self.sdmmc
-            .power
-            .modify(|_, w| unsafe { w.pwrctrl().bits(3) });
-        self.sdmmc.clkcr.modify(|_, w| w.clken().set_bit());
-
-        // Set the data timeout.
-        self.sdmmc
-            .dtimer
-            .write(|w| unsafe { w.bits(self.config.data_timeout) });
-
-        // Select sdmmc for dma 2 channel 4.
-        self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
-    }
-
-    fn init_card(&mut self) -> Result<(), Error> {
-        self.set_clock_divider(0x80);
-
-        // * -> idle
-        self.card_command_none(Command::GO_IDLE_STATE, 0)?;
-
-        // Determine card version.
-        let v2 = match self.check_operating_conditions() {
-            Err(Timeout) => false,
-            Ok(_) => true,
-            e => return e,
-        };
-
-        // idle -> ready
-        let ccs = loop {
-            let result = self.acmd41(v2)?;
-            if result >> 31 != 0 {
-                break (result >> 30) & 1 != 0;
+    fn init_card(&mut self) -> nb::Result<(), Error> {
+        use State::*;
+        match self.state {
+            Reading | Writing => {
+                panic!("attempt to reinit card while still in use")
             }
-        };
 
-        self.card_version = match (v2, ccs) {
-            (false, _) => CardVersion::V1SC,
-            (true, false) => CardVersion::V2SC,
-            (true, true) => CardVersion::V2HC,
-        };
+            Uninitialized | Ready => {
+                self.init_peri(0x80);
+                // * -> idle
+                self.card_command_none(Command::GO_IDLE_STATE, 0)?;
+                // Determine card version.
+                let v2 = match self.check_operating_conditions() {
+                    Err(Timeout) => false,
+                    Ok(_) => true,
+                    Err(e) => return Err(Other(e)),
+                };
 
-        // ready -> ident
-        self.card_command_long(Command::ALL_SEND_CID, 0)?;
-        // ident -> stby
-        let card_rca_status = self.card_command_short(Command::SEND_RELATIVE_ADDR, 0)?;
-        self.rca = card_rca_status & 0xffff_0000;
-        let csd = self.card_command_long(Command::SEND_CSD, self.rca)?;
-        self.csd = match self.card_version {
-            CardVersion::V1SC | CardVersion::V2SC => CSD::V1(csd),
-            CardVersion::V2HC => CSD::V2(csd),
-        };
-        // stby -> tran
-        self.card_command_short(Command::SELECT_CARD, self.rca)?;
-
-        match self.config.bus_width {
-            BusWidth::Bits1 => {
-                self.app_command_short(AppCommand::SET_BUS_WIDTH, 0)?;
-                self.sdmmc
-                    .clkcr
-                    .modify(|_, w| unsafe { w.widbus().bits(0) });
+                self.state = Init1(v2);
+                // Recurse once to start the next part.
+                self.init_card()
             }
-            BusWidth::Bits4 => {
-                self.app_command_short(AppCommand::SET_BUS_WIDTH, 2)?;
-                self.sdmmc
-                    .clkcr
-                    .modify(|_, w| unsafe { w.widbus().bits(1) });
+
+            Init1(v2) => {
+                self.init_peri(0x80);
+                // idle -> ready
+                let result = self.acmd41(v2)?;
+                if result >> 31 == 0 {
+                    return Err(WouldBlock);
+                }
+
+                self.state = Uninitialized;
+                let ccs = (result >> 30) & 1 != 0;
+                self.card_version = match (v2, ccs) {
+                    (false, _) => CardVersion::V1SC,
+                    (true, false) => CardVersion::V2SC,
+                    (true, true) => CardVersion::V2HC,
+                };
+
+                // ready -> ident
+                self.card_command_long(Command::ALL_SEND_CID, 0)?;
+
+                // ident -> stby
+                let card_rca_status = self.card_command_short(Command::SEND_RELATIVE_ADDR, 0)?;
+                self.rca = card_rca_status & 0xffff_0000;
+                let csd = self.card_command_long(Command::SEND_CSD, self.rca)?;
+                self.csd = match self.card_version {
+                    CardVersion::V1SC | CardVersion::V2SC => CSD::V1(csd),
+                    CardVersion::V2HC => CSD::V2(csd),
+                };
+
+                // stby -> tran
+                self.card_command_short(Command::SELECT_CARD, self.rca)?;
+                match self.config.bus_width {
+                    BusWidth::Bits1 => {
+                        self.app_command_short(AppCommand::SET_BUS_WIDTH, 0)?;
+                        self.sdmmc
+                            .clkcr
+                            .modify(|_, w| unsafe { w.widbus().bits(0) });
+                    }
+                    BusWidth::Bits4 => {
+                        self.app_command_short(AppCommand::SET_BUS_WIDTH, 2)?;
+                        self.sdmmc
+                            .clkcr
+                            .modify(|_, w| unsafe { w.widbus().bits(1) });
+                    }
+                }
+
+                self.state = Ready;
+                Ok(())
             }
         }
-
-        self.set_clock_divider(self.config.clock_divider);
-
-        self.state = State::Ready;
-
-        Ok(())
     }
 
     fn card_size(&mut self) -> Result<BlockCount, Error> {
         match self.state {
             State::Uninitialized => Err(Error::Uninitialized),
+            State::Init1(_) => Err(Error::Uninitialized),
             _ => Ok(self.csd.capacity()),
         }
     }
@@ -456,7 +472,7 @@ impl CardHost for Device {
     fn result(&mut self) -> nb::Result<(), Error> {
         let status = self.sdmmc.sta.read();
         match self.state {
-            State::Uninitialized => Err(Other(Error::Uninitialized)),
+            State::Uninitialized | State::Init1(_) => Err(Other(Error::Uninitialized)),
             State::Ready => panic!("called CardHost::result without starting an operation"),
             State::Reading if status.rxact().bit() => Err(WouldBlock),
             State::Writing if status.txact().bit() => Err(WouldBlock),
