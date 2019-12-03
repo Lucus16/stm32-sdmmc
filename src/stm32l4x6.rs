@@ -83,9 +83,7 @@ impl Device {
         use State::*;
         match self.state {
             Uninitialized | Init1(_) | Ready => (self.sdmmc, self.dma, self.pins),
-            Reading | Writing => {
-                panic!("attempt to free card host while still in use")
-            }
+            Reading | Writing => panic!("attempt to free card host while still in use"),
         }
     }
 
@@ -102,6 +100,13 @@ impl Device {
                 .clkcr
                 .modify(|_, w| unsafe { w.clkdiv().bits(clock_divider - 2) });
         }
+
+        self.sdmmc.clkcr.modify(|_, w| unsafe {
+            w.widbus().bits(match self.config.bus_width {
+                BusWidth::Bits1 => 0,
+                BusWidth::Bits4 => 1,
+            })
+        });
 
         self.sdmmc
             .power
@@ -235,11 +240,13 @@ impl Device {
     }
 
     fn check_ready(&mut self) -> Result<(), Error> {
-        self.init_peri(self.config.clock_divider);
         use State::*;
         match self.state {
             Uninitialized | Init1(_) => Err(Error::Uninitialized),
-            Ready => Ok(()),
+            Ready => {
+                self.init_peri(self.config.clock_divider);
+                Ok(())
+            }
             Reading | Writing => Err(Error::Busy),
         }
     }
@@ -270,9 +277,7 @@ impl CardHost for Device {
     fn init_card(&mut self) -> nb::Result<(), Error> {
         use State::*;
         match self.state {
-            Reading | Writing => {
-                panic!("attempt to reinit card while still in use")
-            }
+            Reading | Writing => panic!("attempt to reinit card while still in use"),
 
             Uninitialized | Ready => {
                 self.init_peri(0x80);
@@ -320,20 +325,13 @@ impl CardHost for Device {
 
                 // stby -> tran
                 self.card_command_short(Command::SELECT_CARD, self.rca)?;
-                match self.config.bus_width {
-                    BusWidth::Bits1 => {
-                        self.app_command_short(AppCommand::SET_BUS_WIDTH, 0)?;
-                        self.sdmmc
-                            .clkcr
-                            .modify(|_, w| unsafe { w.widbus().bits(0) });
-                    }
-                    BusWidth::Bits4 => {
-                        self.app_command_short(AppCommand::SET_BUS_WIDTH, 2)?;
-                        self.sdmmc
-                            .clkcr
-                            .modify(|_, w| unsafe { w.widbus().bits(1) });
-                    }
-                }
+                self.app_command_short(
+                    AppCommand::SET_BUS_WIDTH,
+                    match self.config.bus_width {
+                        BusWidth::Bits1 => 0,
+                        BusWidth::Bits4 => 2,
+                    },
+                )?;
 
                 self.state = Ready;
                 Ok(())
