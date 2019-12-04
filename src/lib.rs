@@ -72,6 +72,8 @@ impl core::ops::SubAssign<BlockCount> for BlockIndex {
 
 #[derive(Copy, Clone, Debug)]
 pub enum Error {
+    /// Card does not respond at all, it is probably missing or unpowered.
+    NoCard,
     /// The card host has not yet been initialized, call .init() first.
     Uninitialized,
     /// The DMA peripheral could not keep up with the card during a read. Adjust the relative clock

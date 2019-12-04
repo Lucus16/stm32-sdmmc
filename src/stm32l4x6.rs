@@ -298,10 +298,12 @@ impl CardHost for Device {
             Init1(v2) => {
                 self.init_peri(0x80);
                 // idle -> ready
-                let result = self.acmd41(v2)?;
-                if result >> 31 == 0 {
-                    return Err(WouldBlock);
-                }
+                let result = match self.acmd41(v2) {
+                    Err(Timeout) if !v2 => Err(Other(NoCard)),
+                    Ok(result) if result >> 31 == 0 => Err(WouldBlock),
+                    Err(e) => Err(Other(e)),
+                    Ok(x) => Ok(x),
+                }?;
 
                 self.state = Uninitialized;
                 let ccs = (result >> 30) & 1 != 0;
