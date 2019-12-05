@@ -5,11 +5,12 @@ authors = ["Lars Jellema <lars.jellema@gmail.com>"]
 edition = "2018"
 
 [features]
-stm32l4x6 = []
+stm32l4x1 = ["stm32l4xx-hal/stm32l4x1"]
+stm32l4x6 = ["stm32l4xx-hal/stm32l4x6"]
 
 [dependencies]
 nb = "0.1.2"
 
 [dependencies.stm32l4xx-hal]
-version = "0.5.0"
-features = ["stm32l4x6"]
+git = "https://github.com/Wassasin/stm32l4xx-hal"
+branch = "tmp-operational"

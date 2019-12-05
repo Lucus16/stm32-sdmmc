@@ -1,8 +1,14 @@
 #![no_std]
-#[cfg(feature = "stm32l4x6")]
-mod stm32l4x6;
-#[cfg(feature = "stm32l4x6")]
-pub use stm32l4x6::{Config, Device, Pins};
+#[cfg(any(
+    feature = "stm32l4x1",
+    feature = "stm32l4x6"
+))]
+mod stm32l4xx;
+#[cfg(any(
+    feature = "stm32l4x1",
+    feature = "stm32l4x6"
+))]
+pub use stm32l4xx::{Config, Device, Pins};
 
 pub const BLOCK_SIZE: usize = 0x200;
 

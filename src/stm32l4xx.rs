@@ -1,5 +1,10 @@
 use stm32l4xx_hal::stm32;
 
+#[cfg(feature = "stm32l4x1")]
+type SDMMC = stm32::SDMMC;
+#[cfg(feature = "stm32l4x6")]
+type SDMMC = stm32::SDMMC1;
+
 use crate::Error::*;
 use crate::{
     AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error,
@@ -8,7 +13,11 @@ use crate::{
 use nb::block;
 use nb::Error::{Other, WouldBlock};
 
+#[cfg(feature = "stm32l4x1")]
 const SDMMC_FIFO_OFFSET: u32 = 0x4001_2800 + 0x80;
+#[cfg(feature = "stm32l4x6")]
+const SDMMC_FIFO_OFFSET: u32 = 0x4001_2800 + 0x80;
+
 const SEND_IF_COND_PATTERN: u32 = 0x0000_01aa;
 const STATUS_ERROR_MASK: u32 = 0x0000_05ff;
 
@@ -60,7 +69,7 @@ enum State {
 }
 
 pub struct Device {
-    sdmmc: stm32::SDMMC1,
+    sdmmc: SDMMC,
     dma: stm32::DMA2,
     pins: Pins,
     config: Config,
@@ -92,7 +101,7 @@ impl Default for Config {
 }
 
 impl Device {
-    pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, pins: Pins, config: Config) -> Device {
+    pub fn new(sdmmc: SDMMC, dma: stm32::DMA2, pins: Pins, config: Config) -> Device {
         disable_pins();
         Device {
             sdmmc,
@@ -118,7 +127,7 @@ impl Device {
 
     /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
     /// still ongoing.
-    pub fn free(mut self) -> (stm32::SDMMC1, stm32::DMA2, Pins) {
+    pub fn free(mut self) -> (SDMMC, stm32::DMA2, Pins) {
         self.reset();
         (self.sdmmc, self.dma, self.pins)
     }
