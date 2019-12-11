@@ -310,8 +310,11 @@ impl CardHost for Device {
                 let result = match self.acmd41(v2) {
                     Err(Timeout) if !v2 => Err(Other(NoCard)),
                     Ok(result) if result >> 31 == 0 => Err(WouldBlock),
-                    Err(e) => Err(Other(e)),
                     Ok(x) => Ok(x),
+                    Err(e) => {
+                        self.state = Uninitialized;
+                        Err(Other(e))
+                    }
                 }?;
 
                 self.state = Uninitialized;
