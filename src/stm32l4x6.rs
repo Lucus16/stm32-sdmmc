@@ -77,14 +77,20 @@ impl Device {
         }
     }
 
+    fn reset(&mut self) {
+        self.state = State::Uninitialized;
+        let rcc = unsafe { &*stm32::RCC::ptr() };
+        rcc.ahb1rstr.modify(|_, w| w.dma2rst().set_bit());
+        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().set_bit());
+        rcc.ahb1rstr.modify(|_, w| w.dma2rst().clear_bit());
+        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().clear_bit());
+    }
+
     /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
     /// still ongoing.
-    pub fn free(self) -> (stm32::SDMMC1, stm32::DMA2, Pins) {
-        use State::*;
-        match self.state {
-            Uninitialized | Init1(_) | Ready => (self.sdmmc, self.dma, self.pins),
-            Reading | Writing => panic!("attempt to free card host while still in use"),
-        }
+    pub fn free(mut self) -> (stm32::SDMMC1, stm32::DMA2, Pins) {
+        self.reset();
+        (self.sdmmc, self.dma, self.pins)
     }
 
     fn init_peri(&mut self, clock_divider: u8) {
@@ -277,7 +283,10 @@ impl CardHost for Device {
     fn init_card(&mut self) -> nb::Result<(), Error> {
         use State::*;
         match self.state {
-            Reading | Writing => panic!("attempt to reinit card while still in use"),
+            Reading | Writing => {
+                self.reset();
+                Err(WouldBlock)
+            }
 
             Uninitialized | Ready => {
                 self.init_peri(0x80);
@@ -473,7 +482,7 @@ impl CardHost for Device {
         let status = self.sdmmc.sta.read();
         match self.state {
             State::Uninitialized | State::Init1(_) => Err(Other(Error::Uninitialized)),
-            State::Ready => panic!("called CardHost::result without starting an operation"),
+            State::Ready => Err(Other(NoOperation)),
             State::Reading if status.rxact().bit() => Err(WouldBlock),
             State::Writing if status.txact().bit() => Err(WouldBlock),
             State::Reading | State::Writing => Ok(()),

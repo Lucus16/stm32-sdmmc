@@ -94,6 +94,8 @@ pub enum Error {
     UnknownResult,
     /// An operation is still running. Call .result() until it no longer return WouldBlock.
     Busy,
+    /// A result was requested but no operation was started.
+    NoOperation,
 }
 
 #[derive(Copy, Clone, Debug)]
