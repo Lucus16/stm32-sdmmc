@@ -171,10 +171,17 @@ pub trait CardHost {
     /// reading or writing to it until the operation is finished.
     unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error>;
 
+    /// Write multiple blocks from the SD card into memory. This function is unsafe because it
+    /// reads from the passed memory blocks after the end of their lifetime. Make sure to keep them
+    /// around and avoid writing to them until the operation is finished.
+    unsafe fn write_blocks(&mut self, blocks: &[Block], address: BlockIndex) -> Result<(), Error>;
+
     /// Write a block from the SD card into memory. This function is unsafe because it reads from the
     /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
     /// writing to it until the operation is finished.
-    unsafe fn write_blocks(&mut self, blocks: &[Block], address: BlockIndex) -> Result<(), Error>;
+    unsafe fn write_block(&mut self, block: &Block, address: BlockIndex) -> Result<(), Error> {
+        self.write_blocks(core::slice::from_ref(block), address)
+    }
 
     /// Check the result of a read or write operation.
     fn result(&mut self) -> nb::Result<(), Error>;
