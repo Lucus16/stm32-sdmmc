@@ -3,13 +3,12 @@ use stm32l4xx_hal::stm32;
 use crate::Error::*;
 use crate::{
     AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error,
-    BLOCK_SIZE, CSD,
+    SDStatus, BLOCK_SIZE, CID, CSD, CardStatus,
 };
 use nb::block;
 use nb::Error::{Other, WouldBlock};
 
-const SDMMC1_ADDRESS: u32 = 0x4001_2800;
-const FIFO_OFFSET: u32 = 0x80;
+const SDMMC_FIFO_OFFSET: u32 = 0x4001_2800 + 0x80;
 const SEND_IF_COND_PATTERN: u32 = 0x0000_01aa;
 const STATUS_ERROR_MASK: u32 = 0x0000_05ff;
 
@@ -30,6 +29,7 @@ enum State {
     Ready,
     Reading,
     Writing,
+    Erasing,
 }
 
 pub struct Device {
@@ -41,6 +41,7 @@ pub struct Device {
     rca: u32,
     /// Card Specific Data
     csd: CSD,
+    cid: CID,
     card_version: CardVersion,
 }
 
@@ -73,6 +74,7 @@ impl Device {
             state: State::Uninitialized,
             rca: 0,
             csd: CSD::V1([0; 4]),
+            cid: [0; 4],
             card_version: CardVersion::V1SC,
         }
     }
@@ -128,8 +130,13 @@ impl Device {
         self.dma.cselr.modify(|_, w| w.c4s().bits(0x7));
     }
 
-    pub fn status(&self) -> u32 {
+    pub fn host_status(&self) -> u32 {
         self.sdmmc.sta.read().bits()
+    }
+
+    fn card_status(&mut self) -> Result<CardStatus, Error> {
+        self.init_peri(self.config.clock_divider);
+        Ok(CardStatus(self.card_command_short(Command::SEND_STATUS, self.rca)?))
     }
 
     fn check_operating_conditions(&mut self) -> Result<(), Error> {
@@ -253,7 +260,7 @@ impl Device {
                 self.init_peri(self.config.clock_divider);
                 Ok(())
             }
-            Reading | Writing => Err(Error::Busy),
+            Reading | Writing | Erasing => Err(Error::Busy),
         }
     }
 
@@ -277,13 +284,55 @@ impl Device {
             Ok(())
         }
     }
+
+    unsafe fn setup_read(&mut self, dest: &mut [u8]) {
+        let size = dest.len();
+        assert!(size.is_power_of_two() && size & 3 == 0 && size < 0x40000);
+        // a. Set the data length register.
+        self.sdmmc.dlen.write(|w| w.bits(size as u32));
+        // b. Set the dma channel.
+        //    - Clear any pending interrupts.
+        self.dma.ifcr.write(|w| w.cgif4().set_bit());
+        //    - Set the channel source address.
+        self.dma.cmar4.write(|w| w.bits(dest.as_ptr() as u32));
+        //    - Set the channel destination address.
+        self.dma.cpar4.write(|w| w.bits(SDMMC_FIFO_OFFSET));
+        //    - Set the number of words to transfer.
+        self.dma.cndtr4.write(|w| w.ndt().bits((size >> 2) as u16));
+        //    - Set the word size, direction and increments.
+        self.dma.ccr4.write(|w| {
+            w.dir()
+                .clear_bit()
+                .minc()
+                .set_bit()
+                .pinc()
+                .clear_bit()
+                .msize()
+                .bits32()
+                .psize()
+                .bits32()
+        });
+        //    - Enable the channel.
+        self.dma.ccr4.modify(|_, w| w.en().set_bit());
+        // c. Set the data control register:
+        self.sdmmc.dctrl.write(|w| {
+            w.dten()
+                .set_bit()
+                .dtdir()
+                .set_bit()
+                .dmaen()
+                .set_bit()
+                .dblocksize()
+                .bits(size.trailing_zeros() as u8)
+        });
+    }
 }
 
 impl CardHost for Device {
     fn init_card(&mut self) -> nb::Result<(), Error> {
         use State::*;
         match self.state {
-            Reading | Writing => {
+            Reading | Writing | Erasing => {
                 self.reset();
                 Err(WouldBlock)
             }
@@ -326,7 +375,7 @@ impl CardHost for Device {
                 };
 
                 // ready -> ident
-                self.card_command_long(Command::ALL_SEND_CID, 0)?;
+                self.cid = self.card_command_long(Command::ALL_SEND_CID, 0)?;
 
                 // ident -> stby
                 let card_rca_status = self.card_command_short(Command::SEND_RELATIVE_ADDR, 0)?;
@@ -353,6 +402,25 @@ impl CardHost for Device {
         }
     }
 
+    fn erase_card(&mut self) -> Result<(), Error> {
+        self.check_ready()?;
+        self.card_command_short(Command::ERASE_WR_BLK_START, 0)?;
+        let card_size = self.card_size()?;
+        self.card_command_short(Command::ERASE_WR_BLK_END, card_size)?;
+        // 2 means Full User area Logical Erase
+        self.card_command_short(Command::ERASE, 2)?;
+        self.state = State::Erasing;
+        Ok(())
+    }
+
+    fn card_id(&mut self) -> Result<CID, Error> {
+        match self.state {
+            State::Uninitialized => Err(Error::Uninitialized),
+            State::Init1(_) => Err(Error::Uninitialized),
+            _ => Ok(self.cid),
+        }
+    }
+
     fn card_size(&mut self) -> Result<BlockCount, Error> {
         match self.state {
             State::Uninitialized => Err(Error::Uninitialized),
@@ -361,62 +429,42 @@ impl CardHost for Device {
         }
     }
 
-    #[allow(unused_unsafe)]
+    fn read_sd_status(&mut self) -> Result<SDStatus, Error> {
+        self.check_ready()?;
+        let mut result = SDStatus([0; 64]);
+        unsafe {
+            self.setup_read(&mut result.0);
+        }
+
+        self.app_command_short(AppCommand::SD_STATUS, self.rca)?;
+        self.state = State::Reading;
+        block!(self.result())?;
+        Ok(result)
+    }
+
+    fn erase(&mut self, start: BlockIndex, end: BlockIndex) -> Result<(), Error> {
+        self.check_ready()?;
+        self.card_command_short(Command::ERASE_WR_BLK_START, start)?;
+        self.card_command_short(Command::ERASE_WR_BLK_END, end)?;
+        self.card_command_short(Command::ERASE, 0)?;
+        self.state = State::Erasing;
+        Ok(())
+    }
+
     unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error> {
         self.check_ready()?;
+        self.setup_read(block);
+        match self.card_command_short(Command::READ_BLOCK, address) {
+            Ok(_) => {
+                self.state = State::Reading;
+                Ok(())
+            }
 
-        // a. Set the data length register.
-        self.sdmmc
-            .dlen
-            .write(|w| unsafe { w.bits(block.len() as u32) });
-
-        // b. Set the dma channel.
-        //    - Clear any pending interrupts.
-        self.dma.ifcr.write(|w| w.cgif4().set_bit());
-        //    - Set the channel source address.
-        self.dma
-            .cmar4
-            .write(|w| unsafe { w.bits(block as *const Block as u32) });
-        //    - Set the channel destination address.
-        self.dma
-            .cpar4
-            .write(|w| unsafe { w.bits(SDMMC1_ADDRESS + FIFO_OFFSET) });
-        //    - Set the number of words to transfer.
-        self.dma.cndtr4.write(|w| w.ndt().bits(0x80));
-
-        //    - Set the word size, direction and increments.
-        self.dma.ccr4.write(|w| {
-            w.dir()
-                .clear_bit()
-                .minc()
-                .set_bit()
-                .pinc()
-                .clear_bit()
-                .msize()
-                .bits32()
-                .psize()
-                .bits32()
-        });
-
-        //    - Enable the channel.
-        self.dma.ccr4.modify(|_, w| w.en().set_bit());
-        // c. Set the data control register:
-        self.sdmmc.dctrl.write(|w| unsafe {
-            w.dten()
-                .set_bit()
-                .dtdir()
-                .set_bit()
-                .dmaen()
-                .set_bit()
-                .dblocksize()
-                .bits(0x9)
-        });
-
-        // d. Set the address.
-        // e. Set the command register.
-        self.card_command_short(Command::READ_BLOCK, address.0)?;
-        self.state = State::Reading;
-        Ok(())
+            Err(e) => {
+                // TODO: Disable DMA.
+                Err(e)
+            }
+        }
     }
 
     #[allow(unused_unsafe)]
@@ -438,7 +486,7 @@ impl CardHost for Device {
         //    - Set the channel destination address.
         self.dma
             .cpar4
-            .write(|w| unsafe { w.bits(SDMMC1_ADDRESS + FIFO_OFFSET) });
+            .write(|w| unsafe { w.bits(SDMMC_FIFO_OFFSET) });
         //    - Set the number of words to transfer.
         self.dma
             .cndtr4
@@ -463,7 +511,7 @@ impl CardHost for Device {
 
         // c. Set the address.
         // d. Set the command register.
-        self.card_command_short(Command::WRITE_MULTIPLE_BLOCK, address.0)?;
+        self.card_command_short(Command::WRITE_MULTIPLE_BLOCK, address)?;
         self.state = State::Writing;
 
         // e. Set the data control register:
@@ -489,6 +537,14 @@ impl CardHost for Device {
             State::Reading if status.rxact().bit() => Err(WouldBlock),
             State::Writing if status.txact().bit() => Err(WouldBlock),
             State::Reading | State::Writing => Ok(()),
+            State::Erasing => {
+                return if self.card_status()?.ready_for_data() {
+                    self.state = State::Ready;
+                    Ok(())
+                } else {
+                    Err(WouldBlock)
+                }
+            }
         }?;
 
         self.dma.ccr4.modify(|_, w| w.en().clear_bit());
