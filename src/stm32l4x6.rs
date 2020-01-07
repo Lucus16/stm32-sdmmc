@@ -406,7 +406,7 @@ impl CardHost for Device {
         self.check_ready()?;
         self.card_command_short(Command::ERASE_WR_BLK_START, 0)?;
         let card_size = self.card_size()?;
-        self.card_command_short(Command::ERASE_WR_BLK_END, card_size)?;
+        self.card_command_short(Command::ERASE_WR_BLK_END, card_size - 1)?;
         // 2 means Full User area Logical Erase
         self.card_command_short(Command::ERASE, 2)?;
         self.state = State::Erasing;
