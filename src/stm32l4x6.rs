@@ -22,6 +22,33 @@ type Data2Pin = gpio::gpioc::PC10<Pin>;
 type Data3Pin = gpio::gpioc::PC11<Pin>;
 pub type Pins = (ClockPin, CommandPin, Data0Pin, Data1Pin, Data2Pin, Data3Pin);
 
+const GPIOD_OFFSETS2: u32 = 1 << 4;
+const GPIOC_OFFSETS2: u32 = 1 << 16 | 1 << 18 | 1 << 20 | 1 << 22 | 1 << 24;
+const GPIOD_MASK_2: u32 = !(GPIOD_OFFSETS2 * 0b11);
+const GPIOC_MASK_2: u32 = !(GPIOC_OFFSETS2 * 0b11);
+const GPIOD_MODER_EN: u32 = GPIOD_OFFSETS2 * 0b10;
+const GPIOC_MODER_EN: u32 = GPIOC_OFFSETS2 * 0b10;
+const GPIOD_MODER_DIS: u32 = GPIOD_OFFSETS2 * 0b11;
+const GPIOC_MODER_DIS: u32 = GPIOC_OFFSETS2 * 0b11;
+
+fn enable_pins() {
+    unsafe {
+        let gpiod = &*stm32::GPIOD::ptr();
+        let gpioc = &*stm32::GPIOC::ptr();
+        gpiod.moder.modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_EN));
+        gpioc.moder.modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_EN));
+    }
+}
+
+fn disable_pins() {
+    unsafe {
+        let gpiod = &*stm32::GPIOD::ptr();
+        let gpioc = &*stm32::GPIOC::ptr();
+        gpiod.moder.modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_DIS));
+        gpioc.moder.modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_DIS));
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 enum State {
     Uninitialized,
@@ -66,6 +93,7 @@ impl Default for Config {
 
 impl Device {
     pub fn new(sdmmc: stm32::SDMMC1, dma: stm32::DMA2, pins: Pins, config: Config) -> Device {
+        disable_pins();
         Device {
             sdmmc,
             dma,
@@ -96,6 +124,8 @@ impl Device {
     }
 
     fn init_peri(&mut self, clock_divider: u8) {
+        enable_pins();
+
         // Enable power, then clock.
         self.sdmmc
             .clkcr
@@ -539,6 +569,7 @@ impl CardHost for Device {
             State::Reading | State::Writing => Ok(()),
             State::Erasing => {
                 return if self.card_status()?.ready_for_data() {
+                    disable_pins();
                     self.state = State::Ready;
                     Ok(())
                 } else {
@@ -551,6 +582,7 @@ impl CardHost for Device {
         self.sdmmc
             .icr
             .write(|w| unsafe { w.bits(STATUS_ERROR_MASK) });
+        disable_pins();
         self.state = State::Ready;
         if status.dcrcfail().bit() {
             Err(Other(CRCFail))
