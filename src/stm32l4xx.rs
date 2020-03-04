@@ -124,15 +124,6 @@ impl Device {
         }
     }
 
-    fn reset(&mut self) {
-        self.state = State::Uninitialized;
-        let rcc = unsafe { &*stm32::RCC::ptr() };
-        rcc.ahb1rstr.modify(|_, w| w.dma2rst().set_bit());
-        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().set_bit());
-        rcc.ahb1rstr.modify(|_, w| w.dma2rst().clear_bit());
-        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().clear_bit());
-    }
-
     /// Recycle the object to get back the SDMMC and DMA peripherals. Panics if an operation is
     /// still ongoing.
     pub fn free(mut self) -> (SDMMC, stm32::DMA2, Pins) {
@@ -378,6 +369,16 @@ impl Device {
 }
 
 impl CardHost for Device {
+    fn reset(&mut self) {
+        self.state = State::Uninitialized;
+        let rcc = unsafe { &*stm32::RCC::ptr() };
+        rcc.ahb1rstr.modify(|_, w| w.dma2rst().set_bit());
+        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().set_bit());
+        disable_pins();
+        rcc.ahb1rstr.modify(|_, w| w.dma2rst().clear_bit());
+        rcc.apb2rstr.modify(|_, w| w.sdmmcrst().clear_bit());
+    }
+
     fn init_card(&mut self) -> nb::Result<(), Error> {
         use State::*;
         match self.state {

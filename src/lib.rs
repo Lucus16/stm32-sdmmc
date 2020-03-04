@@ -1,13 +1,7 @@
 #![no_std]
-#[cfg(any(
-    feature = "stm32l4x1",
-    feature = "stm32l4x6"
-))]
+#[cfg(any(feature = "stm32l4x1", feature = "stm32l4x6"))]
 mod stm32l4xx;
-#[cfg(any(
-    feature = "stm32l4x1",
-    feature = "stm32l4x6"
-))]
+#[cfg(any(feature = "stm32l4x1", feature = "stm32l4x6"))]
 pub use stm32l4xx::{Config, Device, Pins};
 
 pub const BLOCK_SIZE: usize = 0x200;
@@ -250,6 +244,9 @@ pub trait CardHost {
 
     /// Erase blocks on the SD card.
     fn erase(&mut self, start: BlockIndex, end: BlockIndex) -> Result<(), Error>;
+
+    /// Reset the card host, disabling it until the next initialization.
+    fn reset(&mut self);
 
     /// Read a block from the SD card into memory. This function is unsafe because it writes to the
     /// passed memory block after the end of its lifetime. Make sure to keep it around and avoid
