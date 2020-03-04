@@ -7,8 +7,8 @@ type SDMMC = stm32::SDMMC1;
 
 use crate::Error::*;
 use crate::{
-    AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardVersion, Command, Error,
-    SDStatus, BLOCK_SIZE, CID, CSD, CardStatus,
+    AppCommand, Block, BlockCount, BlockIndex, BusWidth, CardHost, CardStatus, CardVersion,
+    Command, Error, SDStatus, BLOCK_SIZE, CID, CSD,
 };
 use nb::block;
 use nb::Error::{Other, WouldBlock};
@@ -44,8 +44,12 @@ fn enable_pins() {
     unsafe {
         let gpiod = &*stm32::GPIOD::ptr();
         let gpioc = &*stm32::GPIOC::ptr();
-        gpiod.moder.modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_EN));
-        gpioc.moder.modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_EN));
+        gpiod
+            .moder
+            .modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_EN));
+        gpioc
+            .moder
+            .modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_EN));
     }
 }
 
@@ -53,8 +57,12 @@ fn disable_pins() {
     unsafe {
         let gpiod = &*stm32::GPIOD::ptr();
         let gpioc = &*stm32::GPIOC::ptr();
-        gpiod.moder.modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_DIS));
-        gpioc.moder.modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_DIS));
+        gpiod
+            .moder
+            .modify(|r, w| w.bits(r.bits() & GPIOD_MASK_2 | GPIOD_MODER_DIS));
+        gpioc
+            .moder
+            .modify(|r, w| w.bits(r.bits() & GPIOC_MASK_2 | GPIOC_MODER_DIS));
     }
 }
 
@@ -175,7 +183,9 @@ impl Device {
 
     fn card_status(&mut self) -> Result<CardStatus, Error> {
         self.init_peri(self.config.clock_divider);
-        Ok(CardStatus(self.card_command_short(Command::SEND_STATUS, self.rca)?))
+        Ok(CardStatus(
+            self.card_command_short(Command::SEND_STATUS, self.rca)?,
+        ))
     }
 
     fn check_operating_conditions(&mut self) -> Result<(), Error> {
