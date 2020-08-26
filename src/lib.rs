@@ -6,9 +6,35 @@ pub use stm32l4xx::{Config, Device, Pins};
 
 pub const BLOCK_SIZE: usize = 0x200;
 
-pub type Block = [u8; BLOCK_SIZE];
+/// The Block type wraps a byte array with the size of one block and the alignment necessary for
+/// reading and writing it.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+pub struct Block(pub [u8; BLOCK_SIZE]);
+
 pub type BlockCount = u32;
 pub type BlockIndex = u32;
+
+impl<I: core::slice::SliceIndex<[u8]>> core::ops::Index<I> for Block {
+    type Output = I::Output;
+    #[inline]
+    fn index(&self, index: I) -> &I::Output {
+        &self.0[index]
+    }
+}
+
+impl<I: core::slice::SliceIndex<[u8]>> core::ops::IndexMut<I> for Block {
+    #[inline]
+    fn index_mut(&mut self, index: I) -> &mut I::Output {
+        &mut self.0[index]
+    }
+}
+
+impl Block {
+    pub fn zeroed() -> Self {
+        Block([0; BLOCK_SIZE])
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum Error {
@@ -105,7 +131,10 @@ pub enum CardState {
 }
 
 pub type CID = [u32; 4];
+
+#[repr(C, align(4))]
 pub struct SDStatus([u8; 64]);
+
 pub struct CardStatus(u32);
 
 const ERROR_MASK: u32 = 0xfff98004;

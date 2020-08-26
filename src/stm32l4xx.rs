@@ -327,7 +327,10 @@ impl Device {
 
     unsafe fn setup_read(&mut self, dest: &mut [u8]) {
         let size = dest.len();
-        assert!(size.is_power_of_two() && size & 3 == 0 && size < 0x40000);
+        assert!(size.is_power_of_two());
+        assert!(size & 3 == 0);
+        assert!(size < 0x40000);
+        assert!(dest as *const [u8] as *const u8 as usize & 3 == 0);
         // a. Set the data length register.
         self.sdmmc.dlen.write(|w| w.bits(size as u32));
         // b. Set the dma channel.
@@ -503,7 +506,7 @@ impl CardHost for Device {
 
     unsafe fn read_block(&mut self, block: &mut Block, address: BlockIndex) -> Result<(), Error> {
         self.check_ready()?;
-        self.setup_read(block);
+        self.setup_read(&mut block[..]);
         match self.card_command_short(Command::READ_BLOCK, address) {
             Ok(_) => {
                 self.state = State::Reading;
